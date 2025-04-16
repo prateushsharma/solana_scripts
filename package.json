@@ -1,0 +1,24 @@
+{
+  "name": "solana_token",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "@orca-so/common-sdk": "^0.6.11",
+    "@orca-so/sdk": "^1.2.26",
+    "@solana/spl-token": "^0.4.13",
+    "@solana/spl-token-registry": "^0.2.4574",
+    "@solana/web3.js": "^1.98.0",
+    "axios": "^1.8.4",
+    "bs58": "^6.0.0",
+    "cheerio": "^1.0.0",
+    "decimal.js": "^10.5.0",
+    "dotenv": "^16.5.0"
+  }
+}
