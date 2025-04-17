@@ -11,8 +11,9 @@ const SLIPPAGE_BPS = 50; // 0.5% slippage
 const JUPITER_API_BASE = "https://quote-api.jup.ag/v6";
 const JUPITER_TOKEN_LIST_URL = "https://token.jup.ag/all";
 const TOKEN_CACHE_FILE = "jupiter_tokens.json"; // Changed to mainnet tokens by default
-const NETWORK = process.env.SOLANA_NETWORK || "mainnet-beta"; // Default to devnet now
-const POPULAR_TOKENS = ["USDC", "SOL", "WSOL"]; // Simplified tokens list for devnet
+const NETWORK = process.env.SOLANA_NETWORK || "mainnet-beta"; // Default to mainnet-beta
+const POPULAR_TOKENS = ["USDC", "SOL", "WSOL"]; // Simplified tokens list
+const TRANSACTION_TIMEOUT_MS = 60000; // Increase timeout to 60 seconds
 
 // Configure network specifics
 const NETWORK_CONFIG = {
@@ -36,6 +37,11 @@ const rl = readline.createInterface({
 // Ask question as promise
 function askQuestion(query) {
   return new Promise(resolve => rl.question(query, resolve));
+}
+
+// Sleep function for delays
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 // Load wallet key from file or environment variable
@@ -215,8 +221,51 @@ async function getSwapQuote(inputMint, outputMint, amount) {
   }
 }
 
+// Check transaction status
+async function checkTransactionStatus(connection, signature, maxRetries = 10, initialDelayMs = 500) {
+  let retries = 0;
+  let delay = initialDelayMs;
+  
+  while (retries < maxRetries) {
+    try {
+      const status = await connection.getSignatureStatus(signature, {searchTransactionHistory: true});
+      
+      if (status && status.value) {
+        if (status.value.err) {
+          return { confirmed: false, error: status.value.err };
+        } else if (status.value.confirmationStatus === 'confirmed' || 
+                  status.value.confirmationStatus === 'finalized') {
+          return { confirmed: true };
+        }
+      }
+      
+      // Transaction not found or not confirmed yet, wait and retry
+      await sleep(delay);
+      delay *= 1.5; // Exponential backoff
+      retries++;
+    } catch (error) {
+      console.log(`Error checking transaction status (attempt ${retries}):`, error.message);
+      await sleep(delay);
+      delay *= 1.5;
+      retries++;
+    }
+  }
+  
+  // We've exhausted retries, let's do one final check with transaction history
+  try {
+    const transaction = await connection.getParsedTransaction(signature, {maxSupportedTransactionVersion: 0});
+    if (transaction) {
+      return { confirmed: true }; // If we can get the transaction, it exists
+    }
+  } catch (error) {
+    console.log("Final transaction check failed:", error.message);
+  }
+  
+  return { confirmed: null }; // Unknown status after all retries
+}
+
 // Execute swap - Fixed to match Jupiter API v6 requirements
-async function executeSwap(connection, wallet, quoteResponse) {
+async function executeSwap(connection, wallet, quoteResponse, networkConfig) {
   try {
     console.log("Preparing swap transaction...");
     
@@ -244,7 +293,7 @@ async function executeSwap(connection, wallet, quoteResponse) {
     const swapTransactionBuf = Buffer.from(swapResponse.data.swapTransaction, "base64");
     
     // Check if it's a versioned transaction
-    let signedTransaction;
+    let txid;
     const { VersionedTransaction } = require("@solana/web3.js");
     
     try {
@@ -254,34 +303,80 @@ async function executeSwap(connection, wallet, quoteResponse) {
       
       // Important: For versioned transactions, we need to sign it
       versionedTransaction.sign([wallet]);
-      signedTransaction = versionedTransaction;
+      
+      console.log("Sending signed transaction to Solana network...");
+      
+      // For versioned transactions, send the signed transaction
+      txid = await connection.sendRawTransaction(versionedTransaction.serialize(), {
+        skipPreflight: false,
+        preflightCommitment: "confirmed"
+      });
     } catch (err) {
       console.log("Falling back to legacy transaction format");
       // If versioned transaction deserialization fails, try as a legacy transaction
       const transaction = Transaction.from(swapTransactionBuf);
       
-      // For legacy transactions, we'll use sendAndConfirmTransaction which handles signing
-      const txid = await sendAndConfirmTransaction(
-        connection,
-        transaction,
-        [wallet],
-        { commitment: "confirmed" }
-      );
-      return txid;
+      try {
+        // For legacy transactions, we'll use sendAndConfirmTransaction which handles signing
+        txid = await sendAndConfirmTransaction(
+          connection,
+          transaction,
+          [wallet],
+          { commitment: "confirmed" }
+        );
+        return txid; // If this succeeds, return directly
+      } catch (txError) {
+        // Check if this is a timeout error but the TX was actually submitted
+        if (txError.message.includes("was not confirmed") && txError.message.includes("It is unknown if it succeeded")) {
+          // Extract the transaction signature from the error message
+          const signatureMatch = txError.message.match(/Check signature ([A-Za-z0-9]+)/);
+          if (signatureMatch && signatureMatch[1]) {
+            txid = signatureMatch[1];
+            console.log(`Transaction submitted but confirmation timed out. Signature: ${txid}`);
+          } else {
+            throw txError; // Re-throw if we can't find the signature
+          }
+        } else {
+          throw txError; // Re-throw other errors
+        }
+      }
     }
     
-    console.log("Sending signed transaction to Solana network...");
+    // At this point we have a txid but don't know if it's confirmed
+    console.log(`Transaction submitted with ID: ${txid}`);
+    console.log(`View transaction: ${networkConfig.explorerUrl}/${txid}${networkConfig.explorerParams || ""}`);
+    console.log("Waiting for confirmation...");
     
-    // For versioned transactions, send the signed transaction
-    const txid = await connection.sendRawTransaction(signedTransaction.serialize(), {
-      skipPreflight: false,
-      preflightCommitment: "confirmed"
-    });
+    // Start with a short delay to allow the transaction to propagate
+    await sleep(1000);
     
-    console.log("Transaction sent, waiting for confirmation...");
-    await connection.confirmTransaction(txid, "confirmed");
-    
-    return txid;
+    try {
+      // First try to confirm with standard method (with increased timeout)
+      await connection.confirmTransaction({
+        signature: txid,
+        lastValidBlockHeight: await connection.getBlockHeight(),
+        blockhash: (await connection.getLatestBlockhash()).blockhash
+      }, "confirmed");
+      console.log("Transaction confirmed!");
+      return txid;
+    } catch (confirmError) {
+      console.log("Standard confirmation timed out, checking transaction status manually...");
+      
+      // If standard confirmation fails, check status manually
+      const status = await checkTransactionStatus(connection, txid);
+      
+      if (status.confirmed === true) {
+        console.log("Transaction is confirmed!");
+        return txid;
+      } else if (status.confirmed === false) {
+        console.log("Transaction failed:", status.error);
+        return null;
+      } else {
+        console.log("Transaction status is unknown. Please check manually using the explorer link above.");
+        // Return the txid anyway since it might still succeed
+        return txid;
+      }
+    }
   } catch (err) {
     console.error("Failed to execute swap:", err.message);
     
@@ -480,14 +575,34 @@ async function main() {
     const confirm = await askQuestion("Execute this swap? (y/n): ");
     
     if (confirm.toLowerCase() === 'y') {
-      const txid = await executeSwap(connection, wallet, selectedQuote.quoteResponse);
+      // Execute the swap and get transaction ID
+      const txid = await executeSwap(connection, wallet, selectedQuote.quoteResponse, networkConfig);
       
       if (txid) {
-        console.log("\n✅ Swap successful!");
+        // Check if the balance has actually changed
+        console.log("\nVerifying swap by checking token balance...");
+        await sleep(5000); // Wait a bit for the transaction to fully finalize
+        
+        const newToTokenBalance = await getTokenBalance(connection, walletPublicKey, selectedQuote.token);
+        const newFromTokenBalance = await getTokenBalance(connection, walletPublicKey, fromToken);
+        
         console.log(`Transaction ID: ${txid}`);
-        console.log(`Input: ${amount} ${fromToken.symbol}`);
-        console.log(`Output: ~${selectedQuote.outAmount} ${selectedQuote.token.symbol}`);
         console.log(`View transaction: ${explorerBaseUrl}/${txid}${explorerQueryParams}`);
+        
+        // Try to determine if swap was successful by checking balance change
+        if (newToTokenBalance !== null && newFromTokenBalance !== null) {
+          // We don't have the previous balance of destination token, but the source token should have decreased
+          if (newFromTokenBalance < balance) {
+            console.log("\n✅ Swap successful! (verified by balance change)");
+          } else {
+            console.log("\n⚠️ Transaction was submitted, but balance hasn't changed yet. Please check the explorer link above.");
+          }
+        } else {
+          console.log("\n⚠️ Transaction was submitted, but unable to verify the outcome. Please check the explorer link above.");
+        }
+        
+        console.log(`Input: ${amount} ${fromToken.symbol}`);
+        console.log(`Expected output: ~${selectedQuote.outAmount} ${selectedQuote.token.symbol}`);
       } else {
         console.log("\n❌ Swap failed!");
       }
